@@ -44,6 +44,7 @@ import { cleanupResultIndexes, missionObserverResultCandidateFiles } from "../ru
 import { ASYNC_RETENTION_DELAY_MS, cleanupAsyncRetention } from "../runs/background/async-retention.ts";
 import { createResultWatcher } from "../runs/background/result-watcher.ts";
 import { createResultDeliveryOwnership } from "../runs/background/result-delivery-ownership.ts";
+import { registerSessionLivenessResponder, type SessionLivenessResponder } from "../api/session-liveness.ts";
 import { createScheduledRunManager } from "../runs/background/scheduled-runs.ts";
 import { registerSlashCommands } from "../slash/slash-commands.ts";
 import { registerPromptTemplateDelegationBridge } from "../slash/prompt-template-bridge.ts";
@@ -379,14 +380,48 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		}, run);
 	};
 
+	let sessionLivenessResponder: SessionLivenessResponder | undefined;
+	// Registered before notifier/supervisor teardown: disposal is not evidence of
+	// idle, and must never authorize a consumer to replace this session.
+	pi.on("session_shutdown", () => {
+		sessionLivenessResponder?.dispose();
+		sessionLivenessResponder = undefined;
+		releaseHostSessionLiveness();
+		releaseHostSessionLiveness = () => {};
+	});
+	const invalidateSessionLiveness = () => sessionLivenessResponder?.invalidate();
+	const pendingResultRuns = new Set<string>();
+	const terminalResultRuns = new Set<string>();
+	const candidateResultRuns = new Set<string>();
+	const settledRunIds = new Set<string>();
+	const updateResultRunHold = (runId: string, source: "terminal" | "candidate", pending: boolean) => {
+		const owner = source === "terminal" ? terminalResultRuns : candidateResultRuns;
+		if (pending) owner.add(runId);
+		else owner.delete(runId);
+		if (terminalResultRuns.has(runId) || candidateResultRuns.has(runId)) pendingResultRuns.add(runId);
+		else pendingResultRuns.delete(runId);
+		invalidateSessionLiveness();
+	};
 	const supervisorChannel = createNativeSupervisorChannel(pi, state, {
 		// Owner states are created only by scheduled execution, which loads the executor first.
 		getCurrentOwnerStates: () => executor?.getCurrentSupervisorOwnerStates() ?? [],
+		onPendingChanged: invalidateSessionLiveness,
 	});
-	const waitSubscriptionManager = createWaitSubscriptionManager(pi, state);
 	const mainWatchdog = registerMainWatchdog(pi);
 	const resultDeliveryOwnership = createResultDeliveryOwnership(state);
-	const completionNotifier = registerSubagentNotify(pi, state, { batchConfig: config.completionBatch, ownership: resultDeliveryOwnership });
+	const completionNotifier = registerSubagentNotify(pi, state, {
+		batchConfig: config.completionBatch,
+		ownership: resultDeliveryOwnership,
+		nativeSessionId: () => state.supervisorOwnerSessionId,
+		onLivenessChanged: invalidateSessionLiveness,
+	});
+	const waitSubscriptionManager = createWaitSubscriptionManager(pi, state, { sendLivenessWake: completionNotifier.sendWake });
+	const hasLiveSessionWork = () => hasLiveSubagentWork(state, {
+		pendingResultRuns,
+		settledRunIds,
+		pendingSupervisorRequests: supervisorChannel.pending,
+		hasPendingDelivery: completionNotifier.hasPendingDelivery(),
+	});
 	let retainedNestedRouteTracker: ReturnType<typeof createRetainedNestedRouteTracker> | undefined;
 	const fleetStatus = fleetViewEnabled
 		? new SubagentFleetStatus(state, async (itemKey) => {
@@ -484,7 +519,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const { ensurePoller, refreshWidget, handleStarted, handleComplete, resetJobs, restoreActiveJobs, dispose: disposeAsyncJobTracker } = createAsyncJobTracker(pi, state, DIRS.async, {
 		widgetEnabled: asyncWidgetEnabled,
 		widgetCollapsed: asyncWidgetCollapsed,
-		onJobTerminal: () => refreshResultDelivery(),
+		onJobTerminal: (job) => {
+			if (!job.parentWorkflowRunId && !settledRunIds.has(job.asyncId)) updateResultRunHold(job.asyncId, "terminal", true);
+			refreshResultDelivery();
+		},
+		onJobCleanup: (runId) => {
+			settledRunIds.delete(runId);
+			invalidateSessionLiveness();
+		},
 		supervisorRequestState: supervisorChannel.getSupervisorRequestState,
 	});
 	const resultWatcher = createResultWatcher(
@@ -495,6 +537,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		{
 			notifier: completionNotifier,
 			ownership: resultDeliveryOwnership,
+			onResultCandidate: (runId, pending) => updateResultRunHold(runId, "candidate", pending),
+			onResultDisposition: (runId) => {
+				settledRunIds.add(runId);
+				updateResultRunHold(runId, "terminal", false);
+				updateResultRunHold(runId, "candidate", false);
+			},
 			observeCompletion: (result) => scheduledRunManager.handleAsyncCompletion(result),
 			observedCompletionRunIds: () => scheduledRunManager.observedCompletionRunIds(),
 			hasDeliveryDemand: hasResultDeliveryDemand,
@@ -564,6 +612,13 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		activateSupervisorTransport: () => supervisorChannel.activateTransport(),
 		findPendingAsks: (target) => supervisorChannel.findPendingAsks(target),
 		refreshResultDelivery: () => refreshResultDelivery(),
+		onLivenessChanged: invalidateSessionLiveness,
+		sendLivenessWake: completionNotifier.sendWake,
+		onPublicationFailureDelivered: (runId) => {
+			settledRunIds.add(runId);
+			updateResultRunHold(runId, "terminal", false);
+			updateResultRunHold(runId, "candidate", false);
+		},
 		trackRetainedNestedRoute: undefined,
 	};
 	let executor: SubagentExecutor | undefined;
@@ -836,13 +891,22 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 	const asyncStartedHandler = (payload: unknown) => {
 		handleStarted(payload);
+		const started = payload as { id?: unknown; sessionId?: unknown } | null;
+		const runId = started?.id;
+		if (typeof runId === "string" && started?.sessionId === state.currentSessionId) {
+			settledRunIds.delete(runId);
+			updateResultRunHold(runId, "terminal", false);
+			updateResultRunHold(runId, "candidate", false);
+		}
 		supervisorChannel.activateTransport();
 		refreshResultDelivery();
+		invalidateSessionLiveness();
 		fleetStatus?.refresh();
 	};
 	const asyncCompleteHandler = (payload: unknown) => {
 		handleComplete(payload);
 		refreshResultDelivery();
+		invalidateSessionLiveness();
 		refreshActiveAsyncCapacity();
 		scheduledRunManager.handleAsyncCompletion(payload);
 		fleetStatus?.refresh();
@@ -853,6 +917,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, asyncStartedHandler),
 		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, asyncCompleteHandler),
 		pi.events.on(SUBAGENT_PROCESS_TERMINAL_EVENT, () => {
+			invalidateSessionLiveness();
 			refreshActiveAsyncCapacity();
 			fleetStatus?.refresh();
 		}),
@@ -921,6 +986,10 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		resultDeliveryOwnership.claimPredecessor(previousSessionFile, previousRuntimeSessionId);
 		state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
 		state.supervisorOwnerSessionId = ctx.sessionManager.getSessionId() || null;
+		pendingResultRuns.clear();
+		terminalResultRuns.clear();
+		candidateResultRuns.clear();
+		settledRunIds.clear();
 		transitionResultDelivery();
 		state.parentSessionFile = ctx.sessionManager.getSessionFile();
 		state.trustedSessionFileRoot = state.parentSessionFile ? path.join(getAgentDir(), "sessions") : undefined;
@@ -988,6 +1057,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		cleanup() {
 			if (runtimeCleaned) return;
 			runtimeCleaned = true;
+			sessionLivenessResponder?.dispose();
+			sessionLivenessResponder = undefined;
 			releaseHostSessionLiveness();
 			releaseHostSessionLiveness = () => {};
 			// Workflow continuations retain their launch context; abort them before
@@ -1108,25 +1179,30 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", (event, ctx) => {
+		sessionLivenessResponder?.dispose();
+		sessionLivenessResponder = undefined;
+		releaseHostSessionLiveness();
+		releaseHostSessionLiveness = () => {};
 		installRuntime(ctx);
 		startSessionMaintenance();
 		scheduleModulePreload();
 		const recovering = event.reason === "startup" || event.reason === "reload" || event.reason === "resume";
 		resetSessionState(ctx, recovering, event.previousSessionFile);
-		releaseHostSessionLiveness();
 		const sessionId = ctx.sessionManager.getSessionId();
 		const sessionFile = ctx.sessionManager.getSessionFile();
-		const liveness = sessionId
-			? registerPiWebSessionLiveness({
+		retainedNestedRouteTracker = createRetainedNestedRouteTracker(state, { onLivenessChanged: invalidateSessionLiveness });
+		executorDeps.trackRetainedNestedRoute = retainedNestedRouteTracker.track;
+		if (sessionId) {
+			sessionLivenessResponder = registerSessionLivenessResponder(pi.events, {
+				sessionId,
+				isBusy: () => state.supervisorOwnerSessionId !== sessionId || hasLiveSessionWork(),
+			});
+			const liveness = registerPiWebSessionLiveness({
 				sessionId,
 				...(sessionFile ? { sessionFile } : {}),
-				isActive: () => hasLiveSubagentWork(state) || completionNotifier.hasPendingDelivery(),
-			})
-			: { registered: false, release: () => {} };
-		releaseHostSessionLiveness = liveness.release;
-		if (liveness.registered) {
-			retainedNestedRouteTracker = createRetainedNestedRouteTracker(state);
-			executorDeps.trackRetainedNestedRoute = retainedNestedRouteTracker.track;
+				isActive: () => state.supervisorOwnerSessionId !== sessionId || hasLiveSessionWork(),
+			});
+			releaseHostSessionLiveness = liveness.release;
 		}
 		herdrStatusBridge.sessionStarted({
 			hasUI: ctx.hasUI === true,

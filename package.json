@@ -13,6 +13,7 @@
     "./external-runs": "./src/api/external-runs.ts",
     "./agents": "./src/api/agents.ts",
     "./inspectors": "./src/api/inspectors.ts",
+    "./session-liveness": "./src/api/session-liveness.ts",
     "./delegation": "./src/api/delegation.ts",
     "./capability-ceiling": "./src/api/capability-ceiling.ts",
     "./workflow-resources": "./src/api/workflow-resources.ts",

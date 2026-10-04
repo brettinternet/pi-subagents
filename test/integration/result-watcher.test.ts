@@ -95,6 +95,53 @@ describe("result watcher", () => {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
 	});
+	it("disposes result liveness on accepted notification even when retention cleanup fails", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-liveness-retention-"));
+		const state = createState();
+		state.currentSessionId = "session-1";
+		const runId = "retention-unlink-fails";
+		const resultPath = path.join(resultsDir, `${runId}.json`);
+		let dispositionRecorded = false;
+		let dispositionAtUnlink: boolean | undefined;
+		let unlinkAttempts = 0;
+		const candidateTransitions: boolean[] = [];
+		const unlinkFailure = Object.assign(new Error("fixture cleanup denied"), { code: "EPERM" });
+		const originalError = console.error;
+		console.error = (...args: Parameters<typeof console.error>) => {
+			if (String(args[0]).startsWith("Failed to remove delivered subagent result") && args[1] === unlinkFailure) return;
+			originalError(...args);
+		};
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+			fs: {
+				...fs,
+				unlinkSync(target) {
+					if (String(target) === resultPath) {
+						unlinkAttempts++;
+						dispositionAtUnlink ??= dispositionRecorded;
+						throw unlinkFailure;
+					}
+					return fs.unlinkSync(target);
+				},
+			} as never,
+			deliverIntercomResults: false,
+			notifier: { deliver: async () => true },
+			onResultCandidate: (_id, pending) => candidateTransitions.push(pending),
+			onResultDisposition: () => { dispositionRecorded = true; },
+		});
+		try {
+			watcher.startResultWatcher();
+			writeIndexedResult(resultPath, { id: runId, runId, sessionId: "session-1", success: true, summary: "delivered" });
+			assert.equal(await waitForPredicate(() => unlinkAttempts >= 2), true, "the retained payload keeps retrying cleanup");
+			assert.equal(dispositionAtUnlink, true, "result liveness transfers as soon as notification delivery is accepted");
+			assert.equal(fs.existsSync(resultPath), true, "retention cleanup remains independently retryable");
+			assert.deepEqual(candidateTransitions, [true, false], "already-delivered retained payloads do not reacquire liveness");
+		} finally {
+			watcher.stopResultWatcher();
+			console.error = originalError;
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("does not create Darwin native watchers or idle timers", () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-darwin-idle-"));
 		try {

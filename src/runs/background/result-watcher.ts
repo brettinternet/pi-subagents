@@ -63,6 +63,9 @@ type ResultWatcherDeps = {
 	platform?: NodeJS.Platform;
 	/** Shared current/predecessor session ownership used by the notifier. */
 	ownership?: Pick<ResultDeliveryOwnership, "owns" | "claimedSessionIds">;
+	/** In-memory rollover holds acquired before coalesced result processing and released only after disposition. */
+	onResultCandidate?: (runId: string, pending: boolean) => void;
+	onResultDisposition?: (runId: string) => void;
 };
 
 type ResultFileChild = {
@@ -105,6 +108,7 @@ type ResultFileIdentity = {
 	completionOwnerId?: string;
 	runId?: string;
 	asyncDir?: string;
+	notificationDelivered?: boolean;
 };
 
 interface ResultScanStats {
@@ -132,6 +136,7 @@ function resultFileIdentity(raw: string, file: string): ResultFileIdentity {
 		completionOwnerId: jsonStringProperty(raw, "completionOwnerId"),
 		runId: file.replace(/\.json$/i, ""),
 		asyncDir: jsonStringProperty(raw, "asyncDir"),
+		notificationDelivered: /"notificationDeliveredAt"\s*:\s*\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/.test(raw),
 	};
 }
 
@@ -220,6 +225,7 @@ export function createResultWatcher(
 	const parseResult = deps.parseResult ?? ((raw: string) => JSON.parse(raw) as ResultFileData);
 	const deliverIntercomResults = deps.deliverIntercomResults !== false;
 	const pendingTriggerTurn = new Map<string, boolean>();
+	const pendingResultCandidates = new Map<string, string>();
 	const processing = new Set<string>();
 	const handling = new Set<Promise<void>>();
 	// While deliverPendingResults runs, completions skip the batch delay.
@@ -243,7 +249,45 @@ export function createResultWatcher(
 		return activeSessionId === state.currentSessionId && ownsResult(sessionId, completionOwnerId);
 	};
 
+	const candidateRunId = (file: string, observed?: ReadonlySet<string>): string | undefined => {
+		if (file !== path.basename(file) || !file.endsWith(".json")) return undefined;
+		const inspected = inspectResult(file, undefined, observed);
+		const identity = inspected?.identity;
+		if (identity?.notificationDelivered) return undefined;
+		if (!identity?.sessionId || identity.sessionId !== state.currentSessionId || !identity.runId || !ownsResult(identity.sessionId, identity.completionOwnerId)) return undefined;
+		return identity.runId;
+	};
+	const holdResultCandidate = (file: string, observed?: ReadonlySet<string>): void => {
+		try {
+			const runId = candidateRunId(file, observed);
+			if (!runId || pendingResultCandidates.get(file) === runId) return;
+			const previous = pendingResultCandidates.get(file);
+			if (previous) deps.onResultCandidate?.(previous, false);
+			pendingResultCandidates.set(file, runId);
+			deps.onResultCandidate?.(runId, true);
+		} catch (error) {
+			if (!isAbsentResultCandidate(error)) console.error(`Failed to establish subagent result liveness for '${publicResultPath(file)}':`, error);
+		}
+	};
+	const releaseResultCandidate = (runId: string): void => {
+		let released = false;
+		for (const [file, candidateId] of pendingResultCandidates) {
+			if (candidateId !== runId) continue;
+			pendingResultCandidates.delete(file);
+			released = true;
+		}
+		if (released) deps.onResultCandidate?.(runId, false);
+	};
+	const recordResultDisposition = (runId: string): void => {
+		releaseResultCandidate(runId);
+		deps.onResultDisposition?.(runId);
+	};
+	const clearResultCandidates = (): void => {
+		for (const runId of new Set(pendingResultCandidates.values())) deps.onResultCandidate?.(runId, false);
+		pendingResultCandidates.clear();
+	};
 	const scheduleResult = (file: string, triggerTurn: boolean, delayMs = 0) => {
+		holdResultCandidate(file);
 		const pendingMode = pendingTriggerTurn.get(file);
 		pendingTriggerTurn.set(file, pendingMode === false || !triggerTurn ? false : true);
 		state.resultFileCoalescer.schedule(file, delayMs);
@@ -460,17 +504,19 @@ export function createResultWatcher(
 			if (lastSeenAt !== undefined && Date.now() - lastSeenAt > completionTtlMs) {
 				state.completionSeen.delete(completionKey);
 			} else if (lastSeenAt !== undefined) {
+				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
+				if (markReplacedPayload()) return;
+				recordResultDisposition(runId);
 				if (!observerSucceeded) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
-				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
-				if (markReplacedPayload()) return;
 				if (!completionPersisted) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
 				if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				else releaseResultCandidate(runId);
 				return;
 			}
 
@@ -522,17 +568,19 @@ export function createResultWatcher(
 
 			if (alreadyDelivered) {
 				markSeenWithTtl(state.completionSeen, completionKey, Date.now(), completionTtlMs);
+				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
+				if (markReplacedPayload()) return;
+				recordResultDisposition(runId);
 				if (!observerSucceeded) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
-				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
-				if (markReplacedPayload()) return;
 				if (!completionPersisted) {
 					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 					return;
 				}
 				if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				else releaseResultCandidate(runId);
 				return;
 			}
 
@@ -584,6 +632,7 @@ export function createResultWatcher(
 				return;
 			}
 			if (markReplacedPayload()) return;
+			recordResultDisposition(runId);
 			try {
 				data = markDeliveredNotification(publicResultPath(file), data, runId, Date.now());
 				identityCache.delete(file);
@@ -626,6 +675,7 @@ export function createResultWatcher(
 				return;
 			}
 			if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+			else releaseResultCandidate(runId);
 		} catch (error) {
 			if (isAccessDenied(error)) {
 				console.error(`Failed to process subagent result file '${resultPath}'; will retry:`, error);
@@ -819,6 +869,7 @@ export function createResultWatcher(
 		deliveryActive = true;
 		activeSessionId = state.currentSessionId;
 		deliveryEpoch += 1;
+		clearResultCandidates();
 		identityCache.clear();
 	};
 
@@ -832,6 +883,7 @@ export function createResultWatcher(
 		clearResultScan();
 		state.resultFileCoalescer.clear();
 		pendingTriggerTurn.clear();
+		clearResultCandidates();
 		processing.clear();
 		identityCache.clear();
 	};

@@ -6,6 +6,7 @@
  * observation channel, not a delivery acknowledgement.
  */
 
+import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { debuglog } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -21,6 +22,7 @@ import { safeTerminalText } from "../../shared/display-text.ts";
 import { resolveSubagentResultStatus } from "../../intercom/result-intercom.ts";
 import { isUnexplainedProcessSignal } from "../shared/process-signal.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
+import { isSessionLivenessUuid } from "../../api/session-liveness.ts";
 
 export interface SubagentNotifyChildOutput {
 	workflowKey?: string;
@@ -145,11 +147,15 @@ export interface RegisterSubagentNotifyOptions {
 	now?: () => number;
 	ownership?: Pick<ResultDeliveryOwnership, "owns">;
 	sendRegistry?: CompletionSendRegistry;
+	nativeSessionId?: () => string | null | undefined;
+	onLivenessChanged?: () => void;
 }
 
 export interface CompletionNotifier {
 	deliver(result: CompletionNotification): Promise<boolean>;
 	hasPendingDelivery(): boolean;
+	/** Send a native custom-message wake with a correlation token for its message_start. */
+	sendWake(message: { customType: string; content: string; display: boolean; details?: unknown }, sessionId: string, options?: { triggerTurn?: boolean }): boolean;
 	/** Send every batched completion now instead of waiting for its batch timer. */
 	flush(): void;
 	dispose(): void;
@@ -596,7 +602,33 @@ const processGlobal = globalThis as typeof globalThis & { [completionSendRegistr
 const processCompletionSendRegistry = processGlobal[completionSendRegistrySymbol]
 	?? (processGlobal[completionSendRegistrySymbol] = createCompletionSendRegistry());
 
-function sendCompletion(pi: Pick<ExtensionAPI, "sendMessage">, items: PendingCompletion[]): boolean {
+interface NativeWakeHandoff {
+	sessionId: string;
+}
+
+interface NativeWakeRegistry {
+	handoffs: Map<string, NativeWakeHandoff>;
+	activeSessions: Set<string>;
+}
+
+// Accepted native messages can remain queued across an extension reload, so this
+// correlation state must outlive one notifier. Tokens end on message_start,
+// rejected send, or final session_shutdown; active state ends on agent_settled
+// or session teardown.
+const NATIVE_WAKE_REGISTRY_KEY = Symbol.for("pi-subagents.session-liveness-native-wakes.v1");
+const NATIVE_WAKE_DETAILS_KEY = "piSubagentsSessionLiveness";
+const nativeWakeGlobal = globalThis as typeof globalThis & { [NATIVE_WAKE_REGISTRY_KEY]?: NativeWakeRegistry };
+const nativeWakeRegistry = nativeWakeGlobal[NATIVE_WAKE_REGISTRY_KEY]
+	?? (nativeWakeGlobal[NATIVE_WAKE_REGISTRY_KEY] = { handoffs: new Map(), activeSessions: new Set() });
+
+function handoffDetails(details: unknown, sessionId: string, token: string): Record<string, unknown> {
+	const existing = details && typeof details === "object" && !Array.isArray(details)
+		? details as Record<string, unknown>
+		: details === undefined ? {} : { payload: details };
+	return { ...existing, [NATIVE_WAKE_DETAILS_KEY]: { version: 1, sessionId, token } };
+}
+
+function sendCompletion(pi: Pick<ExtensionAPI, "sendMessage">, items: PendingCompletion[], handoff?: { sessionId: string; token: string }): boolean {
 	if (items.length === 0) return true;
 	const details = items.map((item) => item.details);
 	const content = details.length === 1 ? formatSingleCompletion(details[0]!) : formatGroupedCompletion(details);
@@ -607,6 +639,7 @@ function sendCompletion(pi: Pick<ExtensionAPI, "sendMessage">, items: PendingCom
 				customType: "subagent-notify",
 				content,
 				display,
+				...(handoff ? { details: handoffDetails(undefined, handoff.sessionId, handoff.token) } : {}),
 			},
 			{ triggerTurn: items.some((item) => item.triggerTurn) },
 		);
@@ -772,18 +805,61 @@ export default function registerSubagentNotify(
 	const batchConfig = resolveCompletionBatchConfig(options.batchConfig);
 	const batchers = new Map<string, CompletionBatcher<PendingCompletion>>();
 	let disposed = false;
+	const notifyLivenessChanged = () => {
+		if (disposed) return;
+		try {
+			options.onLivenessChanged?.();
+		} catch {
+			// Liveness hints cannot interrupt completion delivery.
+		}
+	};
+	const currentNativeSessionId = () => options.nativeSessionId?.() ?? undefined;
+	const addHandoff = (sessionId: string | undefined): { sessionId: string; token: string } | undefined => {
+		if (!isSessionLivenessUuid(sessionId)) return undefined;
+		const handoff = { sessionId, token: randomUUID() };
+		nativeWakeRegistry.handoffs.set(handoff.token, { sessionId });
+		notifyLivenessChanged();
+		return handoff;
+	};
+	const removeHandoff = (handoff: { sessionId: string; token: string } | undefined): void => {
+		if (!handoff || nativeWakeRegistry.handoffs.get(handoff.token)?.sessionId !== handoff.sessionId) return;
+		nativeWakeRegistry.handoffs.delete(handoff.token);
+		notifyLivenessChanged();
+	};
+	const removeSessionHandoffs = (sessionId: string): void => {
+		for (const [token, handoff] of nativeWakeRegistry.handoffs) {
+			if (handoff.sessionId === sessionId) nativeWakeRegistry.handoffs.delete(token);
+		}
+		// Shutdown revokes ownership; it does not announce a completed handoff.
+	};
+	const sendWake = (message: { customType: string; content: string; display: boolean; details?: unknown }, sessionId: string, sendOptions: { triggerTurn?: boolean } = {}): boolean => {
+		const triggerTurn = sendOptions.triggerTurn !== false;
+		const handoff = triggerTurn ? addHandoff(sessionId) : undefined;
+		try {
+			pi.sendMessage({
+				...message,
+				...(handoff ? { details: handoffDetails(message.details, handoff.sessionId, handoff.token) } : {}),
+			}, { triggerTurn });
+			return true;
+		} catch {
+			removeHandoff(handoff);
+			return false;
+		}
+	};
 	const ownsResult = options.ownership?.owns
 		?? ((sessionId: string, completionOwnerId: unknown) => sessionId === state.currentSessionId
 			&& typeof completionOwnerId === "string"
 			&& completionOwnerId === state.completionOwnerId);
 
 	const settle = (items: PendingCompletion[], accepted: boolean, reason?: NotificationReason) => {
+		let changed = false;
 		for (const item of items) {
 			if (reason) traceNotification(reason, item.trace);
-			pending.delete(item.key);
+			changed = pending.delete(item.key) || changed;
 			if (accepted) markSeenWithTtl(seen, item.key, now(), ttlMs);
 			item.resolve(accepted);
 		}
+		if (changed) notifyLivenessChanged();
 	};
 	const emit = (items: PendingCompletion[]) => {
 		const accepted: PendingCompletion[] = [];
@@ -807,7 +883,10 @@ export default function registerSubagentNotify(
 			void claim.outcome.then((outcome) => settle([item], outcome, outcome ? undefined : "send_failed"));
 		}
 		const claimedItems = claimed.map(({ item }) => item);
-		const sent = sendCompletion(pi, claimedItems);
+		const triggerTurn = claimedItems.some((item) => item.triggerTurn);
+		const handoff = triggerTurn ? addHandoff(currentNativeSessionId()) : undefined;
+		const sent = sendCompletion(pi, claimedItems, handoff);
+		if (!sent) removeHandoff(handoff);
 		for (const { claim } of claimed) claim.settle?.(sent);
 		settle(claimedItems, sent, sent ? "send_accepted" : "send_failed");
 	};
@@ -860,6 +939,7 @@ export default function registerSubagentNotify(
 		let resolve!: (accepted: boolean) => void;
 		const completion = new Promise<boolean>((settleCompletion) => { resolve = settleCompletion; });
 		pending.set(key, completion);
+		notifyLivenessChanged();
 		const item: PendingCompletion = {
 			key,
 			details,
@@ -891,10 +971,49 @@ export default function registerSubagentNotify(
 	const unsubscribeForeground = pi.events.on(SUBAGENT_FOREGROUND_COMPLETE_EVENT, (data) => {
 		void deliver(data as CompletionNotification);
 	});
+	const nativePi = pi as unknown as { on?: (event: string, handler: (event: unknown) => void) => () => void };
+	const nativeUnsubscribes: Array<() => void> = [];
+	if (typeof nativePi.on === "function") {
+		nativeUnsubscribes.push(nativePi.on("message_start", (event) => {
+			if (!event || typeof event !== "object" || !("message" in event)) return;
+			const message = (event as { message?: unknown }).message;
+			if (!message || typeof message !== "object" || Array.isArray(message)) return;
+			const record = message as Record<string, unknown>;
+			if (record.role !== "custom" || !record.details || typeof record.details !== "object" || Array.isArray(record.details)) return;
+			const details = record.details as Record<string, unknown>;
+			const handoff = details[NATIVE_WAKE_DETAILS_KEY];
+			if (!handoff || typeof handoff !== "object" || Array.isArray(handoff)) return;
+			const value = handoff as Record<string, unknown>;
+			if (value.version !== 1 || !isSessionLivenessUuid(value.sessionId) || typeof value.token !== "string") return;
+			if (currentNativeSessionId() !== value.sessionId || !nativeWakeRegistry.activeSessions.has(value.sessionId)) return;
+			if (nativeWakeRegistry.handoffs.get(value.token)?.sessionId !== value.sessionId) return;
+			nativeWakeRegistry.handoffs.delete(value.token);
+			notifyLivenessChanged();
+		}));
+		nativeUnsubscribes.push(nativePi.on("agent_start", () => {
+			const sessionId = currentNativeSessionId();
+			if (isSessionLivenessUuid(sessionId)) nativeWakeRegistry.activeSessions.add(sessionId);
+		}));
+		nativeUnsubscribes.push(nativePi.on("agent_settled", () => {
+			const sessionId = currentNativeSessionId();
+			if (isSessionLivenessUuid(sessionId)) nativeWakeRegistry.activeSessions.delete(sessionId);
+		}));
+		nativeUnsubscribes.push(nativePi.on("session_start", () => {
+			const sessionId = currentNativeSessionId();
+			if (isSessionLivenessUuid(sessionId)) nativeWakeRegistry.activeSessions.delete(sessionId);
+		}));
+		nativeUnsubscribes.push(nativePi.on("session_shutdown", () => {
+			const sessionId = currentNativeSessionId();
+			if (!isSessionLivenessUuid(sessionId)) return;
+			nativeWakeRegistry.activeSessions.delete(sessionId);
+			removeSessionHandoffs(sessionId);
+		}));
+	}
 
 	return {
 		deliver,
-		hasPendingDelivery: () => pending.size > 0,
+		sendWake,
+		hasPendingDelivery: () => pending.size > 0 || (nativeWakeRegistry.handoffs.size > 0 && isSessionLivenessUuid(currentNativeSessionId()) && [...nativeWakeRegistry.handoffs.values()].some((handoff) => handoff.sessionId === currentNativeSessionId())),
 		flush() {
 			for (const batcher of batchers.values()) batcher.flush();
 		},
@@ -903,7 +1022,7 @@ export default function registerSubagentNotify(
 			disposed = true;
 			for (const batcher of batchers.values()) settle(batcher.dispose(), false, "dispose_pending");
 			batchers.clear();
-			for (const unsubscribe of [unsubscribeAsync, unsubscribeForeground]) {
+			for (const unsubscribe of [unsubscribeAsync, unsubscribeForeground, ...nativeUnsubscribes]) {
 				try {
 					unsubscribe?.();
 				} catch {

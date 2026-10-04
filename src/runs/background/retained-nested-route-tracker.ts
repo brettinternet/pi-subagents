@@ -7,6 +7,7 @@ interface RetainedNestedRouteTrackerOptions {
 	pollIntervalMs?: number;
 	platform?: NodeJS.Platform;
 	watch?: typeof fs.watch;
+	onLivenessChanged?: () => void;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 5000;
@@ -40,6 +41,7 @@ export function createRetainedNestedRouteTracker(
 			if (hasLiveNestedDescendants(projectNestedEvents(retained).children)) return;
 			state.retainedForegroundNestedRoutes?.delete(rootRunId);
 			close(rootRunId);
+			options.onLivenessChanged?.();
 		} catch (error) {
 			console.error(`Failed to refresh retained nested descendants for foreground run '${rootRunId}':`, error);
 		}
@@ -69,6 +71,7 @@ export function createRetainedNestedRouteTracker(
 	const track = (rootRunId: string): void => {
 		const retained = state.retainedForegroundNestedRoutes?.get(rootRunId);
 		if (!retained) return;
+		options.onLivenessChanged?.();
 		if (shouldUseNativeFsWatch("retained-nested-route-tracker", options.platform) && !watchers.has(rootRunId)) {
 			try {
 				const watcher = watch(retained.eventSink, () => scheduleRefresh(rootRunId));

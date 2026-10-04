@@ -477,6 +477,9 @@ interface ExecutorDeps {
 	activateSupervisorTransport?: () => void;
 	findPendingAsks?: Parameters<typeof steerAsyncRun>[0]["findPendingAsks"];
 	refreshResultDelivery?: () => void;
+	onLivenessChanged?: () => void;
+	sendLivenessWake?: (message: { customType: string; content: string; display: boolean; details?: unknown }, sessionId: string, options?: { triggerTurn?: boolean }) => boolean;
+	onPublicationFailureDelivered?: (runId: string) => void;
 	trackRetainedNestedRoute?: (rootRunId: string) => void;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	/** Set when this executor runs inside a child session; carries the runtime settings the host passes instead of environment variables. */
@@ -569,7 +572,7 @@ function readWorkflowScriptFile(requestedPath: string, requestedCwd: string | un
 	return { script };
 }
 
-export function removeForegroundControlIfIdle(state: SubagentState, runId: string, trackRetainedNestedRoute?: (rootRunId: string) => void): boolean {
+export function removeForegroundControlIfIdle(state: SubagentState, runId: string, trackRetainedNestedRoute?: (rootRunId: string) => void, onLivenessChanged?: () => void): boolean {
 	const control = state.foregroundControls.get(runId);
 	if (control && (!foregroundSchedulingSettled(control) || (control.activeChildren?.size ?? 0) > 0)) return false;
 	if (control?.nestedRoute && trackRetainedNestedRoute) {
@@ -582,6 +585,7 @@ export function removeForegroundControlIfIdle(state: SubagentState, runId: strin
 	retainNestedLookupRoute(state, control?.nestedRoute, control?.sessionId);
 	state.foregroundControls.delete(runId);
 	if (state.lastForegroundControlId === runId) state.lastForegroundControlId = null;
+	onLivenessChanged?.();
 	return true;
 }
 
@@ -4212,7 +4216,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	const finishTrackedForegroundChild = () => {
 		if (!foregroundControl) return;
 		const wasActive = foregroundControl.activeChildren?.has(0) === true;
-		finishForegroundChild(foregroundControl, 0);
+		finishForegroundChild(foregroundControl, 0, deps.onLivenessChanged);
 		if (wasActive) syncHerdrForegroundChild();
 	};
 	if (foregroundControl) {
@@ -4363,7 +4367,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 						try {
 							finishTrackedForegroundChild();
 						} finally {
-							removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute);
+							removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute, deps.onLivenessChanged);
 						}
 					}
 				}
@@ -5546,6 +5550,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				deps.state.workflowControllers ??= new Map();
 				deps.state.workflowChildStops ??= new Map();
 				deps.state.workflowControllers.set(workflowRunId, controller);
+				deps.onLivenessChanged?.();
 				workflowCapacity?.markWorkflowStarted();
 				if (workflowCapacity) deps.state.activeAsyncCapacity = getActiveAsyncCapacitySnapshot(currentSessionId, resolveMaxActiveAsyncRunsPerSession(deps.config.maxActiveAsyncRunsPerSession), { liveWorkflowRunIds: new Set(deps.state.workflowControllers.keys()), abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) });
 				let status: AsyncStatus = {
@@ -5611,16 +5616,18 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					// actionable wake instead of leaving the parent asleep.
 					if (resultWriteFailureWakeDelivered) return false;
 					if (deps.state.currentSessionId !== currentSessionId || deps.state.completionOwnerId !== completionOwnerId) return false;
+					const failureMessage = {
+						customType: "subagent-workflow-result-write-failed",
+						content: message,
+						display: true,
+					};
 					try {
-						deps.pi.sendMessage(
-							{
-								customType: "subagent-workflow-result-write-failed",
-								content: message,
-								display: true,
-							},
-							{ triggerTurn: true },
-						);
+						const delivered = deps.sendLivenessWake
+							? deps.sendLivenessWake(failureMessage, ctx.sessionManager.getSessionId() ?? "", { triggerTurn: true })
+							: (deps.pi.sendMessage(failureMessage, { triggerTurn: true }), true);
+						if (!delivered) throw new Error("Pi rejected the workflow result publication failure wake.");
 						resultWriteFailureWakeDelivered = true;
+						deps.onPublicationFailureDelivered?.(workflowRunId);
 					} catch (sendError) {
 						console.error(`Failed to send workflow result write failure notification for '${workflowRunId}':`, sendError);
 					}
@@ -5753,6 +5760,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				} catch (error) {
 					deps.state.workflowControllers?.delete(workflowRunId);
 					deps.state.asyncJobs.delete(workflowRunId);
+					deps.onLivenessChanged?.();
 					deps.state.fleetJobs?.delete(workflowRunId);
 					workflowCapacity?.rollback();
 					indexPersistence.dispose();
@@ -6113,14 +6121,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 									workflowRunning: notification.workflowRunning,
 								});
 								try {
-									deps.pi.sendMessage(
-										{
-											customType: "subagent-incremental-child-notify",
-											content: formatIncrementalChildCompletion(notification),
-											display: notification.outcome !== "completed",
-										},
-										{ triggerTurn: incrementalChildCompletionTriggersTurn(notification, requestParams.scheduleOrigin) },
-									);
+									const message = {
+										customType: "subagent-incremental-child-notify",
+										content: formatIncrementalChildCompletion(notification),
+										display: notification.outcome !== "completed",
+									};
+									const triggerTurn = incrementalChildCompletionTriggersTurn(notification, requestParams.scheduleOrigin);
+									if (deps.sendLivenessWake) {
+										if (!deps.sendLivenessWake(message, ctx.sessionManager.getSessionId() ?? "", { triggerTurn })) throw new Error("Pi rejected the incremental child completion wake.");
+									} else deps.pi.sendMessage(message, { triggerTurn });
 								} catch (sendError) {
 									console.error(`Failed to send incremental child completion notification for '${notification.childKey}':`, sendError);
 								}
@@ -6375,6 +6384,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						persistClosed = true;
 						deps.state.workflowControllers?.delete(workflowRunId);
 						deps.state.workflowChildStops?.delete(workflowRunId);
+						deps.onLivenessChanged?.();
 						deps.state.activeAsyncCapacity = workflowCapacity?.reconcile(new Set(deps.state.workflowControllers?.keys() ?? []))
 							?? deps.state.activeAsyncCapacity;
 					}
@@ -7768,6 +7778,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			};
 			deps.state.foregroundControls.set(runId, foregroundControl);
 			deps.state.lastForegroundControlId = runId;
+			deps.onLivenessChanged?.();
 			deps.activateSupervisorTransport?.();
 			deps.refreshResultDelivery?.();
 		}
@@ -7908,8 +7919,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (effectiveAsync && (asyncLaunchFailed || (activeAsyncCapacity && !activeAsyncCapacity.owner.runnerStartedAt))) deps.state.liveAsyncSessionRoots?.delete(asyncRunId);
 			if (activeAsyncCapacity && !activeAsyncCapacity.owner.runnerStartedAt) activeAsyncCapacity.rollback();
 			if (foregroundControl) {
-				settleForegroundSchedulingOwner(foregroundControl);
-				removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute);
+				settleForegroundSchedulingOwner(foregroundControl, deps.onLivenessChanged);
+				removeForegroundControlIfIdle(deps.state, runId, deps.trackRetainedNestedRoute, deps.onLivenessChanged);
 			}
 		}
 

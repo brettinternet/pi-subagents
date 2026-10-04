@@ -589,7 +589,31 @@ This matters because "is the parent busy?" is the wrong idle signal. A parent th
 
 When pi-subagents runs inside a compatible pi-web host, it discovers the versioned `Symbol.for("@agegr/pi-web/session-liveness/v1")` registry and registers one provider for the current session. The provider reports live `queued`/`running` async jobs, active nested descendants (including foreground routes retained after their direct parent settles), foreground controls that still have a scheduling owner or active child, and completion notifications waiting for their batch-delivery timer. Retained terminal history, future schedules, and wait subscriptions do not make a session live by themselves. The registration is replaced on session changes and released during runtime shutdown or reload; other hosts remain unaffected.
 
-If your host reclaims idle sessions, keep a session alive while it still has live detached work:
+Hosts embedding this extension can query its exact-session busy state through the optional `pi-subagents/session-liveness` API:
+
+```ts
+import {
+  SESSION_LIVENESS_CHANGED_EVENT,
+  querySessionLiveness,
+} from "pi-subagents/session-liveness";
+
+pi.events.on(SESSION_LIVENESS_CHANGED_EVENT, (change) => {
+  // The event is only an invalidation hint; query again for the exact session.
+});
+
+const liveness = querySessionLiveness(pi.events, sessionId);
+if (!liveness) {
+  // No compatible producer answered. Unknown is not idle.
+}
+```
+
+The query is synchronous, reads only in-memory ownership, and uses `ctx.sessionManager.getSessionId()` (the SDK UUID, not the session file path). Separately installed extensions can use the event contract without a runtime import. Emit `pi-subagents:session-liveness:query:v1` with `{ version: 1, sessionId }`; the owner synchronously populates `request.result` with `{ version: 1, sessionId, busy }`. Subscribe first to `pi-subagents:session-liveness:changed:v1`, whose `{ version: 1, sessionId }` payload only means re-query that session.
+
+A missing answer, invalid session id, or disposed producer is unavailable, not `busy: false`. Busy covers active children and workflows, pending supervisor replies, undelivered results through publication and retry, and accepted waking messages until their matching custom `message_start`. Quiet non-waking delivery can release ownership without another parent turn. Failed/cancelled runs remain owned until their final disposition, not merely a stop request. Shutdown revokes the responder without announcing idle.
+
+This API does not replace Pi's lifecycle. After a waking message starts, wait for the parent to process it and reach `agent_settled`; recheck the exact-session snapshot and pending-message/idle state immediately before automatic replacement. Do not advance directly on `subagent:async-complete` or a liveness-change event. Pi does not expose an acknowledgement for a queued custom message discarded without `message_start` or `session_shutdown`; in that exceptional case the owner conservatively remains busy until shutdown rather than risk losing the result.
+
+Legacy hosts without this in-process contract must keep sessions alive while detached work remains. For their artifact-based inspection:
 
 - Read run state from the status files under the async run directory rather than from event traffic. A long, quiet workflow sends almost nothing to the parent, so recent-activity heuristics conclude the wrong thing.
 - Treat `queued` and `running` as live, matching `isActiveAsyncState`. An interrupted run that is `paused` is finalized. A workflow that paused because a child used `contact_supervisor` still has a live child; keep that parent session until reconcile writes `complete` or `failed`.

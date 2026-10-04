@@ -24,7 +24,14 @@ export interface PiWebSessionLivenessHandle {
 	release: () => void;
 }
 
-type LiveWorkState = Pick<SubagentState, "asyncJobs" | "foregroundControls" | "retainedForegroundNestedRoutes">;
+type LiveWorkState = Pick<SubagentState, "asyncJobs" | "foregroundControls" | "retainedForegroundNestedRoutes"> & Partial<Pick<SubagentState, "workflowControllers">>;
+
+export interface LiveWorkAdditionalState {
+	pendingResultRuns?: ReadonlySet<string>;
+	settledRunIds?: ReadonlySet<string>;
+	pendingSupervisorRequests?: ReadonlyMap<string, { expectsReply?: boolean }>;
+	hasPendingDelivery?: boolean;
+}
 
 function resolveRegistry(): PiWebSessionLivenessRegistry | null {
 	const value = (globalThis as Record<PropertyKey, unknown>)[Symbol.for(PI_WEB_SESSION_LIVENESS_REGISTRY_KEY)];
@@ -42,9 +49,13 @@ export function retainLiveForegroundNestedRoute(state: Pick<SubagentState, "reta
 	return true;
 }
 
-export function hasLiveSubagentWork(state: LiveWorkState): boolean {
+export function hasLiveSubagentWork(state: LiveWorkState, additional: LiveWorkAdditionalState = {}): boolean {
+	if (additional.hasPendingDelivery === true || (additional.pendingResultRuns?.size ?? 0) > 0) return true;
+	if ([...(additional.pendingSupervisorRequests?.values() ?? [])].some((request) => request.expectsReply === true)) return true;
+	if ((state.workflowControllers?.size ?? 0) > 0) return true;
 	for (const job of state.asyncJobs.values()) {
-		if (job.status === "queued" || job.status === "running" || hasLiveNestedDescendants(job.nestedChildren)) return true;
+		if (additional.settledRunIds?.has(job.asyncId) !== true && (job.status === "queued" || job.status === "running")) return true;
+		if (hasLiveNestedDescendants(job.nestedChildren)) return true;
 	}
 	for (const control of state.foregroundControls.values()) {
 		if ((control.schedulingOwners ?? 0) > 0

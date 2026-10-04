@@ -89,9 +89,10 @@ export function retainForegroundSchedulingOwner(control: ForegroundRunControl): 
 	control.updatedAt = Date.now();
 }
 
-export function settleForegroundSchedulingOwner(control: ForegroundRunControl): void {
+export function settleForegroundSchedulingOwner(control: ForegroundRunControl, onChange?: () => void): void {
 	control.schedulingOwners = Math.max(0, (control.schedulingOwners ?? 0) - 1);
 	control.updatedAt = Date.now();
+	onChange?.();
 }
 
 export function foregroundSchedulingSettled(control: ForegroundRunControl): boolean {
@@ -144,7 +145,7 @@ export function updateForegroundChild(control: ForegroundRunControl, index: numb
 	syncCurrentChild(control, child);
 }
 
-export function finishForegroundChild(control: ForegroundRunControl, index: number): void {
+export function finishForegroundChild(control: ForegroundRunControl, index: number, onChange?: () => void): void {
 	removeLivePromptAudit(control, index);
 	control.activeChildren?.delete(index);
 	if (control.currentIndex === index) {
@@ -154,4 +155,5 @@ export function finishForegroundChild(control: ForegroundRunControl, index: numb
 		else clearCurrentChild(control);
 	}
 	control.updatedAt = Date.now();
+	onChange?.();
 }

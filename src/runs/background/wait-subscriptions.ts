@@ -58,6 +58,7 @@ interface WaitSubscriptionManagerOptions {
 	now?: () => number;
 	pollIntervalMs?: number;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
+	sendLivenessWake?: (message: { customType: string; content: string; display: boolean; details?: unknown }, sessionId: string, options?: { triggerTurn?: boolean }) => boolean;
 }
 
 function isNotFound(error: unknown): boolean {
@@ -187,18 +188,21 @@ export function createWaitSubscriptionManager(
 			console.error(`Failed to clear wait subscription '${record.token}'; it remains armed:`, error);
 			return;
 		}
+		const message = {
+			customType: "subagent-wait-subscription",
+			content: `Wait subscription ${record.token} fired for run ${record.runId}: ${outcome}. ${detail}`,
+			display: true,
+			details: {
+				token: record.token,
+				runId: record.runId,
+				outcome,
+				...(completion ? { completions: [completion] } : {}),
+			},
+		};
 		try {
-			pi.sendMessage({
-				customType: "subagent-wait-subscription",
-				content: `Wait subscription ${record.token} fired for run ${record.runId}: ${outcome}. ${detail}`,
-				display: true,
-				details: {
-					token: record.token,
-					runId: record.runId,
-					outcome,
-					...(completion ? { completions: [completion] } : {}),
-				},
-			}, { triggerTurn: true });
+			if (options.sendLivenessWake && state.supervisorOwnerSessionId) {
+				if (!options.sendLivenessWake(message, state.supervisorOwnerSessionId, { triggerTurn: true })) throw new Error("Pi rejected the wait subscription wake.");
+			} else pi.sendMessage(message, { triggerTurn: true });
 		} catch (error) {
 			console.error(`Failed to deliver wait subscription '${record.token}' after clearing it:`, error);
 		}
