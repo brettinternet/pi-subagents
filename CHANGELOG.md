@@ -4,6 +4,8 @@
 
 ### Added
 
+- Hosts can query exact-session liveness through `pi-subagents/session-liveness` before automatically replacing an idle parent. Ownership covers active children, supervisor replies, result delivery, and queued completion messages until the parent receives them. Thanks to [@brettinternet](https://github.com/brettinternet) for [#2674](https://github.com/nicobailon/pi-subagents/pull/2674).
+
 - Schedules accept `every: "day"` or `"week"` with a local `HH:mm`, an explicit IANA timezone, and weekly weekday selections. Missing local times are skipped and repeated times fire once. Restoration re-resolves the pending local date; existing overlap, catch-up, quiet and mission controls apply. Thanks to [@quifox](https://github.com/quifox) for [#815](https://github.com/nicobailon/pi-subagents/issues/815).
 
 ### Changed

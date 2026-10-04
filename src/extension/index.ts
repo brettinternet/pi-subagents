@@ -493,6 +493,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		});
 	};
 	const hasResultDeliveryDemand = () => {
+		if (pendingResultRuns.size > 0) return true;
 		if ([...state.asyncJobs.values()].some((job) => job.status === "queued" || job.status === "running")) return true;
 		if (state.foregroundControls.size > 0) return true;
 		if (scheduledRunManager.observedCompletionRunIds().size > 0) return true;
@@ -524,6 +525,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			refreshResultDelivery();
 		},
 		onJobCleanup: (runId) => {
+			// Display expiry is not a result disposition. Unresolved holds keep
+			// delivery demand alive even after this job leaves the widget.
 			settledRunIds.delete(runId);
 			invalidateSessionLiveness();
 		},

@@ -261,6 +261,96 @@ const supervisorCleanupScript = String.raw`
 	process.stdout.write(JSON.stringify({ pendingBeforeReply: true, idleAfterReply: true }));
 `;
 
+const statusReadFailureScript = String.raw`
+	import assert from "node:assert/strict";
+	import * as fs from "node:fs";
+	import * as path from "node:path";
+	import { createEventBus } from "@earendil-works/pi-coding-agent";
+	import registerSubagentExtension from "./src/extension/index.ts";
+	import { querySessionLiveness } from "./src/api/session-liveness.ts";
+	import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
+	import { DIRS, SUBAGENT_ASYNC_STARTED_EVENT } from "./src/shared/types.ts";
+	import { resultFilePath, writeAsyncResultFile } from "./src/runs/background/result-files.ts";
+
+	// Darwin's existing demand-driven delivery must survive display retention.
+	Object.defineProperty(process, "platform", { value: "darwin" });
+	const nativeSetInterval = globalThis.setInterval;
+	const nativeClearInterval = globalThis.clearInterval;
+	const nativeSetTimeout = globalThis.setTimeout;
+	const nativeClearTimeout = globalThis.clearTimeout;
+	const polls = new Map();
+	const cleanups = new Map();
+	globalThis.setInterval = (handler, delay, ...args) => {
+		if (delay === 3000 && (new Error().stack ?? "").includes("/result-watcher.ts")) {
+			const token = { unref() {} };
+			polls.set(token, () => handler(...args));
+			return token;
+		}
+		return nativeSetInterval(handler, delay, ...args);
+	};
+	globalThis.clearInterval = (token) => { if (!polls.delete(token)) nativeClearInterval(token); };
+	globalThis.setTimeout = (handler, delay, ...args) => {
+		if (delay === 10000 && (new Error().stack ?? "").includes("/async-job-tracker.ts")) {
+			const token = { unref() {} };
+			cleanups.set(token, () => handler(...args));
+			return token;
+		}
+		return nativeSetTimeout(handler, delay, ...args);
+	};
+	globalThis.clearTimeout = (token) => { if (!polls.delete(token) && !cleanups.delete(token)) nativeClearTimeout(token); };
+	const sessionId = "33333333-3333-4333-8333-333333333333";
+	const completionOwnerId = currentCompletionOwnerId();
+	const events = createEventBus();
+	const handlers = new Map();
+	let accept;
+	const accepted = new Promise((resolve) => { accept = resolve; });
+	const pi = new Proxy({
+		events,
+		on(name, handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); return () => {}; },
+		registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, getSessionName() {},
+		sendMessage(message) { if (message.customType === "subagent-notify") accept(message); },
+	}, { get(target, property) { return property in target ? target[property] : () => undefined; } });
+	const ctx = {
+		cwd: process.cwd(), hasUI: false,
+		ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
+		sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; } },
+		modelRegistry: { getAvailable() { return []; } },
+	};
+	const busy = () => querySessionLiveness(events, sessionId)?.busy;
+	registerSubagentExtension(pi);
+	for (const handler of handlers.get("session_start") ?? []) await handler({ reason: "startup" }, ctx);
+	const id = "status-read-failure";
+	const asyncDir = path.join(DIRS.async, id);
+	fs.mkdirSync(asyncDir, { recursive: true });
+	fs.writeFileSync(path.join(asyncDir, "status.json"), "invalid json");
+	events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id, sessionId, completionOwnerId, asyncDir, agent: "worker" });
+	await new Promise((resolve) => nativeSetTimeout(resolve, 0));
+	assert.equal(cleanups.size, 1, "status-read failure scheduled display cleanup");
+	assert.equal(busy(), true);
+	assert.equal(polls.size, 1);
+	for (const poll of [...polls.values()]) poll();
+	assert.equal(polls.size, 1, "unresolved result ownership must keep the producer's delivery demand alive");
+	for (const cleanup of [...cleanups.values()]) cleanup();
+	assert.equal(busy(), true, "display expiry is not evidence that a child or result has settled");
+	for (const poll of [...polls.values()]) poll();
+	assert.equal(polls.size, 1, "delivery remains active after the tracked display job is removed");
+	writeAsyncResultFile(resultFilePath(DIRS.results, id), {
+		id, runId: id, sessionId, completionOwnerId, agent: "worker", mode: "single",
+		state: "failed", success: false, summary: "Recovered child failure", timestamp: Date.now(),
+	});
+	for (const poll of [...polls.values()]) poll();
+	const message = await accepted;
+	assert.equal(busy(), true, "recovered result transfers ownership to its native wake");
+	for (const handler of handlers.get("agent_start") ?? []) handler({});
+	for (const handler of handlers.get("message_start") ?? []) handler({ message: { role: "custom", ...message } });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(busy(), false, "a real disposition releases the hold even after display cleanup");
+	for (const poll of [...polls.values()]) poll();
+	assert.equal(polls.size, 0, "delivery demand stops once the final obligation is consumed");
+	for (const handler of handlers.get("session_shutdown") ?? []) await handler({ reason: "quit" }, ctx);
+	process.stdout.write(JSON.stringify({ recoveredAfterCleanup: true }));
+`;
+
 function runIsolatedExtensionScript(root: string, script: string): string {
 	fs.mkdirSync(path.join(root, "home"), { recursive: true });
 	fs.mkdirSync(path.join(root, "agent"), { recursive: true });
@@ -284,6 +374,15 @@ function runIsolatedExtensionScript(root: string, script: string): string {
 }
 
 describe("registered extension session liveness producers", () => {
+	it("keeps failed-status result delivery alive past display cleanup, then releases the recovered handoff", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-status-failure-"));
+		try {
+			assert.deepEqual(JSON.parse(runIsolatedExtensionScript(root, statusReadFailureScript)), { recoveredAfterCleanup: true });
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("stays continuously busy across independent children, terminal publication, failed send retry, cancellation, and parent handoff", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-session-liveness-extension-"));
 		try {
